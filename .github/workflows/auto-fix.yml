@@ -56,25 +56,23 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
           ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
-          DEFAULT_REPO_OWNER: ${{ github.repository_owner }}
           PARSED_ISSUE_JSON_PATH: parsed_issue.json
         run: python scripts/parse_issue.py
 
-      # Clone the public same-owner target repository into target-repo/.
-      # This intentionally uses only the built-in GITHUB_TOKEN.
+      # Clone the validated GitHub HTTPS repository URL into target-repo/.
+      # The URL is parsed and validated by scripts/parse_issue.py before this step.
       - name: Clone target repository
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          REPO_URL="$(python -c 'import json; print(json.load(open("parsed_issue.json"))["repo_url"])')"
           OWNER="$(python -c 'import json; print(json.load(open("parsed_issue.json"))["repo_owner"])')"
           REPO="$(python -c 'import json; print(json.load(open("parsed_issue.json"))["repo_name"])')"
           rm -rf target-repo
-          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git" target-repo
-          echo "Cloned ${OWNER}/${REPO} into target-repo/"
+          git clone --depth 1 "${REPO_URL}.git" target-repo
+          echo "Cloned ${REPO_URL} (${OWNER}/${REPO}) into target-repo/"
           find target-repo -maxdepth 1 -type f -print | sort
 
-      # Ask Claude to inspect Python files and overwrite only the affected file.
+      # Ask Claude to inspect candidate files and overwrite the affected files.
       # Uses Haiku (cheapest Claude 3 tier). Override with repo variable ANTHROPIC_MODEL if needed.
       - name: Generate AI bug fix with Claude
         env:

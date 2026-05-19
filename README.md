@@ -1,6 +1,6 @@
 # MissionMind AI Automation
 
-This repository contains an end-to-end GitHub Issue driven AI bug-fixing workflow. When an issue is opened in `missionmind-ai-automation`, GitHub Actions parses the issue, clones the public same-owner target repo, asks Claude to patch the affected backend or UI source file, pushes an `ai-fix-*` branch, opens a pull request, and comments the PR URL back on the original issue.
+This repository contains an end-to-end GitHub Issue driven AI bug-fixing workflow. When an issue is opened in `missionmind-ai-automation`, GitHub Actions parses a full GitHub repository URL from the issue, validates it, clones that repository, asks Claude to patch the affected backend or UI source files, pushes an `ai-fix-*` branch, opens a pull request, and comments the PR URL back on the original issue.
 
 ## Architecture
 
@@ -14,7 +14,13 @@ GitHub Issue opened
 scripts/parse_issue.py -> parsed_issue.json
         |
         v
-Clone target repo into target-repo/
+Validate https://github.com/<owner>/<repo>
+        |
+        v
+Extract repo_owner and repo_name
+        |
+        v
+Clone repo URL into target-repo/
         |
         v
 scripts/claude_fix.py -> fix_result.json
@@ -29,10 +35,10 @@ scripts/create_pr.py -> pr_result.json
 scripts/comment_pr.py -> comment PR URL on original issue
 ```
 
-Target repository for the current demo:
+Example target repository URL:
 
 ```text
-ai-bugfix-demo-repo
+https://github.com/abishekn15/ai-bugfix-demo-repo
 ```
 
 ## Workflow Execution Flow
@@ -49,15 +55,16 @@ on:
 The job uses `ubuntu-latest` and Python `3.11`, then runs:
 
 1. Checkout the automation repository.
-2. Parse the issue title/body into `parsed_issue.json`.
-3. Clone the target repo into `target-repo/` using only the built-in `GITHUB_TOKEN`.
-4. Run Claude using `ANTHROPIC_API_KEY` (default model: **claude-3-haiku-20240307** for lower cost).
-5. Overwrite only the affected source file inside `target-repo/`.
-6. Create branch `ai-fix-<issue-number>`.
-7. Commit the generated change.
-8. Push the branch.
-9. Create a pull request.
-10. Comment the PR URL on the original issue.
+2. Parse `Repo URL:` and the issue title/body into `parsed_issue.json`.
+3. Validate the repo URL and extract `repo_owner` / `repo_name`.
+4. Clone the validated repo URL into `target-repo/`.
+5. Run Claude using `ANTHROPIC_API_KEY` (default model: **claude-3-haiku-20240307** for lower cost).
+6. Overwrite affected source files inside `target-repo/`.
+7. Create branch `ai-fix-<issue-number>`.
+8. Commit the generated changes.
+9. Push the branch.
+10. Create a pull request.
+11. Comment the PR URL on the original issue.
 
 ## GitHub Settings
 
@@ -115,7 +122,8 @@ Title:
 Division API crashes
 
 Body:
-Repo: ai-bugfix-demo-repo
+Repo URL:
+https://github.com/abishekn15/ai-bugfix-demo-repo
 
 Bug Description:
 Division crashes when denominator is 0.
@@ -127,7 +135,37 @@ Actual Result:
 ZeroDivisionError
 ```
 
-`Repo:` is required. `Owner:` / `Org:` is optional. If omitted, the workflow uses the same GitHub owner as the automation repository.
+`Repo URL:` is required. It must be a full GitHub HTTPS repository URL.
+
+## Repo URL Validation Rules
+
+Accepted format:
+
+```text
+https://github.com/<owner>/<repo>
+```
+
+Valid examples:
+
+```text
+https://github.com/openai/openai-python
+https://github.com/my-org/hr-worker-api
+https://github.com/abishekn15/ai-bugfix-demo-repo
+```
+
+Invalid examples:
+
+```text
+git@github.com:user/repo.git
+ssh://git@github.com/user/repo.git
+https://gitlab.com/user/repo
+../../../etc/passwd
+https://github.com/user
+https://github.com/user/repo?ref=main
+https://github.com/user/repo.git
+```
+
+The parser rejects non-HTTPS URLs, non-GitHub hosts, SSH syntax, local paths, malformed URLs, missing repo names, query strings, fragments, and `.git` suffixes in the issue body.
 
 ## Example Generated PR
 
@@ -166,7 +204,9 @@ Please review before merging.
 - Branches are always named `ai-fix-<issue-number>`.
 - Automation scripts only modify files inside `target-repo/`.
 - Issue body text is never executed as a shell command.
-- Repository names are validated before clone/push usage.
+- Repository URLs are strictly validated before clone usage.
+- Only `https://github.com/<owner>/<repo>` issue URLs are accepted.
+- The workflow never builds or executes arbitrary clone commands from issue text.
 - Claude is asked to return only the complete corrected source code for each affected candidate file.
 - Claude output is rejected if it is empty, unchanged, Markdown-wrapped, or invalid where validation is available.
 - Any UTF-8 text file under `target-repo/` can be scanned and fixed.
@@ -191,10 +231,10 @@ For safety, the automation still stays narrow in how it applies changes:
 Parse an example issue:
 
 ```bash
-DEFAULT_REPO_OWNER="abishekn15" \
 ISSUE_TITLE="Division API crashes" \
 ISSUE_BODY="$(cat <<'EOF'
-Repo: ai-bugfix-demo-repo
+Repo URL:
+https://github.com/abishekn15/ai-bugfix-demo-repo
 
 Bug Description:
 Division crashes when denominator is 0.
@@ -234,6 +274,22 @@ Local commit/push/PR scripts require valid GitHub authentication in the same way
 `Missing required environment variable: ANTHROPIC_API_KEY`
 
 Add the `ANTHROPIC_API_KEY` repository secret.
+
+`Issue body must include 'Repo URL: https://github.com/<owner>/<repo>'`
+
+Use `Repo URL:` instead of the old `Repo:` field.
+
+`Repo URL must use https://`
+
+SSH URLs such as `git@github.com:user/repo.git`, local paths, and `ssh://` URLs are intentionally rejected.
+
+`Repo URL host must be github.com`
+
+Only GitHub repository URLs are allowed. GitLab, Bitbucket, or private Git server URLs are rejected.
+
+`Repo URL must not include params, query strings, or fragments`
+
+Use the clean repository URL only, for example `https://github.com/abishekn15/ai-bugfix-demo-repo`.
 
 `Claude returned malformed Python` / `Claude returned malformed JSON`
 

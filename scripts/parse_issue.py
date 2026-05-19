@@ -2,9 +2,9 @@
 """Parse GitHub Issue details for the automation pipeline.
 
 The GitHub Actions workflow passes issue data through environment variables.
-This script extracts the target repository name and bug description, validates
-required fields, prints structured logs, and writes parsed_issue.json for the
-downstream Claude, git, PR, and issue-comment steps.
+This script extracts a validated GitHub repository URL and bug description,
+prints structured logs, and writes parsed_issue.json for the downstream Claude,
+git, PR, and issue-comment steps.
 """
 
 from __future__ import annotations
@@ -15,6 +15,12 @@ import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlparse
+
+
+GITHUB_HOST = "github.com"
+GITHUB_OWNER_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+GITHUB_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class IssueParseError(ValueError):
@@ -29,6 +35,7 @@ class IssueContext:
     issue_title: str
     issue_url: str
     issue_author: str
+    repo_url: str
     repo_owner: str
     repo_name: str
     bug_description: str
@@ -47,43 +54,59 @@ def get_optional_env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
-def extract_repo_name(issue_body: str) -> str:
-    """Extract the repository name from a line like 'Repo: HR-worker-api'."""
-    match = re.search(r"(?im)^\s*repo\s*:\s*(?P<repo>[A-Za-z0-9_.-]+)\s*$", issue_body)
-    if not match:
-        raise IssueParseError("Issue body must include a 'Repo: <repository-name>' line.")
-    return match.group("repo")
-
-
-def extract_repo_owner(issue_body: str) -> str | None:
-    """Extract optional owner/org from 'Owner: acme' or 'Org: acme' in the issue body."""
-    match = re.search(
-        r"(?im)^\s*(?:owner|org)\s*:\s*(?P<owner>[A-Za-z0-9_.-]+)\s*$",
-        issue_body,
+def extract_repo_url(issue_body: str) -> str:
+    """Extract the full GitHub repository URL from 'Repo URL:'."""
+    pattern = re.compile(
+        r"(?ims)^\s*repo\s+url\s*:\s*(?P<repo_url>.*?)(?=^\s*[A-Za-z][A-Za-z0-9 ]*\s*:\s*$|\Z)"
     )
+    match = pattern.search(issue_body)
     if not match:
-        return None
-    return match.group("owner")
-
-
-def resolve_repo_owner(issue_body: str) -> str:
-    """Prefer explicit Owner/Org in the body; otherwise use DEFAULT_REPO_OWNER env."""
-    explicit = extract_repo_owner(issue_body)
-    if explicit:
-        return explicit
-    default = get_optional_env("DEFAULT_REPO_OWNER")
-    if not default:
         raise IssueParseError(
-            "Set an 'Owner: <github-org-or-user>' line in the issue body, "
-            "or pass DEFAULT_REPO_OWNER from the workflow (typically the automation repo owner)."
+            "Issue body must include 'Repo URL: https://github.com/<owner>/<repo>'."
         )
-    return default
+
+    repo_url = match.group("repo_url").strip()
+    if not repo_url:
+        raise IssueParseError("Repo URL cannot be empty.")
+    if len(repo_url.split()) != 1:
+        raise IssueParseError("Repo URL must contain exactly one URL and no extra text.")
+    return repo_url
+
+
+def validate_and_parse_repo_url(repo_url: str) -> tuple[str, str]:
+    """Validate and split https://github.com/<owner>/<repo>.
+
+    This intentionally rejects SSH syntax, local paths, query strings, fragments,
+    non-GitHub hosts, missing owner/repo segments, and .git suffixes in the issue.
+    """
+    parsed = urlparse(repo_url)
+    if parsed.scheme != "https":
+        raise IssueParseError("Repo URL must use https://.")
+    if parsed.netloc.lower() != GITHUB_HOST:
+        raise IssueParseError("Repo URL host must be github.com.")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise IssueParseError("Repo URL must not include params, query strings, or fragments.")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 2:
+        raise IssueParseError("Repo URL must have exactly two path parts: <owner>/<repo>.")
+
+    owner, repo = parts
+    if parsed.path != f"/{owner}/{repo}":
+        raise IssueParseError("Repo URL must not include extra slashes or trailing slash.")
+    if not GITHUB_OWNER_PATTERN.fullmatch(owner):
+        raise IssueParseError(f"Invalid GitHub owner in Repo URL: {owner!r}.")
+    if repo.endswith(".git"):
+        raise IssueParseError("Repo URL must not include a .git suffix.")
+    if not GITHUB_REPO_PATTERN.fullmatch(repo):
+        raise IssueParseError(f"Invalid GitHub repo name in Repo URL: {repo!r}.")
+    return owner, repo
 
 
 def extract_section(issue_body: str, section_name: str) -> str:
     """Extract a Markdown-style section until the next '<Heading>:' line."""
     pattern = re.compile(
-        rf"(?ims)^\s*{re.escape(section_name)}\s*:\s*(?P<value>.*?)(?=^\s*[A-Za-z][A-Za-z0-9 ]*\s*:|\Z)"
+        rf"(?ims)^\s*{re.escape(section_name)}\s*:\s*(?P<value>.*?)(?=^\s*[A-Za-z][A-Za-z0-9 ]*\s*:\s*$|\Z)"
     )
     match = pattern.search(issue_body)
     if not match:
@@ -98,14 +121,17 @@ def extract_section(issue_body: str, section_name: str) -> str:
 def parse_issue_from_environment() -> IssueContext:
     """Build an IssueContext from GitHub Actions environment variables."""
     issue_body = get_required_env("ISSUE_BODY")
+    repo_url = extract_repo_url(issue_body)
+    repo_owner, repo_name = validate_and_parse_repo_url(repo_url)
 
     return IssueContext(
         issue_number=get_optional_env("ISSUE_NUMBER", "unknown"),
         issue_title=get_required_env("ISSUE_TITLE"),
         issue_url=get_optional_env("ISSUE_URL", "unknown"),
         issue_author=get_optional_env("ISSUE_AUTHOR", "unknown"),
-        repo_owner=resolve_repo_owner(issue_body),
-        repo_name=extract_repo_name(issue_body),
+        repo_url=repo_url,
+        repo_owner=repo_owner,
+        repo_name=repo_name,
         bug_description=extract_section(issue_body, "Bug Description"),
     )
 
@@ -140,9 +166,16 @@ def main() -> int:
     log_info("Parsed GitHub Issue successfully", **parsed_data)
     log_info(
         "Automation input summary",
+        repo_url=issue_context.repo_url,
         repo_owner=issue_context.repo_owner,
         repo_name=issue_context.repo_name,
         bug_description=issue_context.bug_description,
+    )
+    log_info(
+        "Parsed repository URL",
+        repo_url=issue_context.repo_url,
+        extracted_owner=issue_context.repo_owner,
+        extracted_repo=issue_context.repo_name,
     )
 
     json_path_raw = os.getenv("PARSED_ISSUE_JSON_PATH", "").strip()
