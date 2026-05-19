@@ -28,7 +28,8 @@ from typing import Any
 
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-DEFAULT_MODEL = "claude-3-5-sonnet-latest"
+# Haiku is the cheapest Claude 3 tier; suitable for small targeted fixes.
+DEFAULT_MODEL = "claude-3-haiku-20240307"
 MAX_FILE_BYTES = 80_000
 MAX_TOTAL_PROMPT_CHARS = 140_000
 SUPPORTED_BUG_KEYWORDS = (

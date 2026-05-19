@@ -51,7 +51,7 @@ The job uses `ubuntu-latest` and Python `3.11`, then runs:
 1. Checkout the automation repository.
 2. Parse the issue title/body into `parsed_issue.json`.
 3. Clone the target repo into `target-repo/` using only the built-in `GITHUB_TOKEN`.
-4. Run Claude using `ANTHROPIC_API_KEY`.
+4. Run Claude using `ANTHROPIC_API_KEY` (default model: **claude-3-haiku-20240307** for lower cost).
 5. Overwrite only the affected Python file inside `target-repo/`.
 6. Create branch `ai-fix-<issue-number>`.
 7. Commit the generated change.
@@ -97,6 +97,14 @@ Steps:
 3. Click `New repository secret`.
 4. Name: `ANTHROPIC_API_KEY`.
 5. Value: your Anthropic API key.
+
+## Claude model (cost)
+
+The workflow sets **`ANTHROPIC_MODEL`** to **`claude-3-haiku-20240307`** (cheap Haiku tier). `scripts/claude_fix.py` uses the same ID as its default if you run it locally without that env var.
+
+If Anthropic returns a billing or credit error, adding credits is required; a cheaper model only reduces cost per run, it does not bypass a zero balance.
+
+To use a different model later, change `ANTHROPIC_MODEL` in `.github/workflows/auto-fix.yml` or set a repository variable and reference it from the workflow.
 
 ## Example Issue Format
 
@@ -211,7 +219,9 @@ git clone --depth 1 https://github.com/abishekn15/ai-bugfix-demo-repo.git target
 Run Claude locally:
 
 ```bash
-ANTHROPIC_API_KEY="your-anthropic-api-key" python scripts/claude_fix.py
+ANTHROPIC_API_KEY="your-anthropic-api-key" \
+ANTHROPIC_MODEL="claude-3-haiku-20240307" \
+python scripts/claude_fix.py
 ```
 
 Local commit/push/PR scripts require valid GitHub authentication in the same way the workflow uses `GITHUB_TOKEN`.
