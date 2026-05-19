@@ -1,0 +1,58 @@
+# Workflow name shown in the GitHub Actions tab.
+name: Auto Fix Issue Parser
+
+# Run this workflow only when a new GitHub Issue is opened.
+on:
+  issues:
+    types:
+      - opened
+
+# Keep permissions minimal for this phase because the workflow only reads issue data
+# from the GitHub event payload and writes logs.
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  parse-issue:
+    # Use the latest Ubuntu runner provided by GitHub Actions.
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checkout is required so the runner can access scripts/parse_issue.py.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Install Python for running the issue parsing script.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Print the raw issue values from the GitHub event payload so operators can
+      # confirm exactly what triggered the automation.
+      - name: Print raw issue details
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+        run: |
+          echo "Issue number: ${ISSUE_NUMBER}"
+          echo "Issue title: ${ISSUE_TITLE}"
+          echo "Issue author: ${ISSUE_AUTHOR}"
+          echo "Issue URL: ${ISSUE_URL}"
+          echo "Issue body:"
+          printf '%s\n' "${ISSUE_BODY}"
+
+      # Pass the issue title and body to the Python parser. Environment variables
+      # preserve multiline issue bodies more safely than command-line arguments.
+      - name: Parse issue request
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+        run: python scripts/parse_issue.py
