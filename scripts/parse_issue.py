@@ -3,8 +3,8 @@
 
 The GitHub Actions workflow passes issue data through environment variables.
 This script extracts the target repository name and bug description, validates
-required fields, prints structured logs, and optionally writes parsed_issue.json
-for Phase 2 (issue comments, cloning the target repository).
+required fields, prints structured logs, and writes parsed_issue.json for the
+downstream Claude, git, PR, and issue-comment steps.
 """
 
 from __future__ import annotations

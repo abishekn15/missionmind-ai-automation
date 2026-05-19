@@ -1,18 +1,43 @@
 # MissionMind AI Automation
 
-Phase 1 creates a GitHub Issue-driven automation entry point. When a new issue is opened, GitHub Actions reads the issue title and body, extracts the target repository name and bug description, and prints structured logs.
+This repository contains an end-to-end GitHub Issue driven AI bug-fixing workflow. When an issue is opened in `missionmind-ai-automation`, GitHub Actions parses the issue, clones the public same-owner target repo, asks Claude to patch the affected Python file, pushes an `ai-fix-*` branch, opens a pull request, and comments the PR URL back on the original issue.
 
-**Phase 2** (current): after a successful parse, the workflow writes `parsed_issue.json`, posts an acknowledgement comment on the same issue, and shallow-clones the target repository into `target-repo/` on the runner (for upcoming fix/analysis steps).
+## Architecture
 
-## Files Created
+```text
+GitHub Issue opened
+        |
+        v
+.github/workflows/auto-fix.yml
+        |
+        v
+scripts/parse_issue.py -> parsed_issue.json
+        |
+        v
+Clone target repo into target-repo/
+        |
+        v
+scripts/claude_fix.py -> fix_result.json
+        |
+        v
+scripts/git_commit_push.py -> git_result.json
+        |
+        v
+scripts/create_pr.py -> pr_result.json
+        |
+        v
+scripts/comment_pr.py -> comment PR URL on original issue
+```
 
-- `.github/workflows/auto-fix.yml` defines the GitHub Actions workflow.
-- `scripts/parse_issue.py` parses the issue payload, prints structured logs, and writes `parsed_issue.json`.
-- `scripts/format_issue_comment.py` builds the Markdown body for the acknowledgement comment.
+Target repository for the current demo:
 
-## How The Workflow Triggers
+```text
+ai-bugfix-demo-repo
+```
 
-The workflow runs only when a GitHub Issue is opened:
+## Workflow Execution Flow
+
+The workflow runs only for newly opened issues:
 
 ```yaml
 on:
@@ -21,123 +46,207 @@ on:
       - opened
 ```
 
-It does not run when an issue is edited, closed, reopened, labeled, assigned, or commented on.
+The job uses `ubuntu-latest` and Python `3.11`, then runs:
 
-## Issue Format
+1. Checkout the automation repository.
+2. Parse the issue title/body into `parsed_issue.json`.
+3. Clone the target repo into `target-repo/` using only the built-in `GITHUB_TOKEN`.
+4. Run Claude using `ANTHROPIC_API_KEY`.
+5. Overwrite only the affected Python file inside `target-repo/`.
+6. Create branch `ai-fix-<issue-number>`.
+7. Commit the generated change.
+8. Push the branch.
+9. Create a pull request.
+10. Comment the PR URL on the original issue.
 
-Create a GitHub Issue with this structure:
+## GitHub Settings
+
+In the automation repository settings, enable GitHub Actions and set workflow permissions so the built-in token can write:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+```
+
+This implementation intentionally does **not** use:
+
+- `TARGET_REPO_CLONE_TOKEN`
+- `TARGET_REPO_PUSH_TOKEN`
+
+It uses only:
+
+- built-in `GITHUB_TOKEN`
+- `ANTHROPIC_API_KEY`
+
+Important GitHub limitation: `GITHUB_TOKEN` is scoped by GitHub to the repository where the workflow runs. The clone works for your public same-owner demo repo. If GitHub blocks pushing a branch or creating a PR in another repository, that is a platform permission boundary, not a script bug.
+
+## Required Secret
+
+Create this repository secret in `missionmind-ai-automation`:
+
+```text
+ANTHROPIC_API_KEY
+```
+
+Steps:
+
+1. Open GitHub repository settings.
+2. Go to `Secrets and variables` -> `Actions`.
+3. Click `New repository secret`.
+4. Name: `ANTHROPIC_API_KEY`.
+5. Value: your Anthropic API key.
+
+## Example Issue Format
+
+Create an issue in `missionmind-ai-automation`:
 
 ```text
 Title:
-Login API returns 500
+Division API crashes
 
 Body:
-Repo: HR-worker-api
+Repo: ai-bugfix-demo-repo
 
 Bug Description:
-Login API crashes when email is empty
+Division crashes when denominator is 0.
 
 Expected Result:
-Validation error
+Should return validation message.
 
 Actual Result:
-500 Internal Server Error
+ZeroDivisionError
 ```
 
-Required fields:
+`Repo:` is required. `Owner:` / `Org:` is optional. If omitted, the workflow uses the same GitHub owner as the automation repository.
 
-- `Repo:` is the target repository name (short name, for example `HR-worker-api`).
-- `Bug Description:` describes the bug that later automation phases can process.
+## Example Generated PR
 
-Optional fields:
+The workflow creates a branch like:
 
-- `Owner:` or `Org:` — GitHub user or organization that owns the target repo. If omitted, the workflow uses the automation repository’s owner (`github.repository_owner`) as `DEFAULT_REPO_OWNER`.
-
-## How To Create An Issue
-
-1. Push this repository to GitHub.
-2. Open the repository in GitHub.
-3. Go to `Issues`.
-4. Click `New issue`.
-5. Use a title like `Login API returns 500`.
-6. Add the issue body using the required format above.
-7. Click `Submit new issue`.
-
-GitHub Actions will start automatically after the issue is opened.
-
-## How To View Logs
-
-1. Open the repository in GitHub.
-2. Go to the `Actions` tab.
-3. Select the `Auto Fix Issue Parser` workflow run.
-4. Open the `parse-issue` job.
-5. Review the `Print raw issue details`, `Parse issue request`, `Post acknowledgement on issue`, and `Shallow clone target repository` steps.
-
-The parser prints JSON logs similar to:
-
-```json
-{"bug_description": "Login API crashes when email is empty", "issue_author": "octocat", "issue_number": "1", "issue_title": "Login API returns 500", "issue_url": "https://github.com/example/repo/issues/1", "level": "INFO", "message": "Parsed GitHub Issue successfully", "repo_name": "HR-worker-api", "repo_owner": "example"}
+```text
+ai-fix-17
 ```
 
-## How To Test Locally
+The PR title will be:
 
-Run the parser with the same environment variables the workflow uses. If the issue body does **not** contain `Owner:` or `Org:`, set `DEFAULT_REPO_OWNER` (usually your GitHub user or org):
+```text
+AI Fix: Division API crashes
+```
+
+The PR body includes:
+
+- source issue number
+- source issue title
+- AI-generated fix notice
+- modified files
+- human review disclaimer
+
+After PR creation, the original issue receives a comment:
+
+```text
+AI-generated fix PR created:
+https://github.com/abishekn15/ai-bugfix-demo-repo/pull/1
+
+Please review before merging.
+```
+
+## Safety Protections
+
+- The workflow never pushes directly to `main`.
+- Branches are always named `ai-fix-<issue-number>`.
+- Automation scripts only modify files inside `target-repo/`.
+- Issue body text is never executed as a shell command.
+- Repository names are validated before clone/push usage.
+- Claude is asked to return only complete corrected Python code.
+- Claude output is rejected if it is empty, unchanged, Markdown-wrapped, or invalid Python.
+- Only Python files under `target-repo/` are scanned.
+- Large Python files are skipped to keep prompts bounded.
+- Structured JSON logs are printed for every major step.
+
+## Supported Bug Types
+
+The current `claude_fix.py` supports focused Python fixes for:
+
+- division by zero
+- missing validation
+- wrong HTTP status code
+
+Unsupported bug categories fail safely instead of producing broad or risky edits.
+
+## Local Testing
+
+Parse an example issue:
 
 ```bash
-DEFAULT_REPO_OWNER="your-github-org-or-user" \
-ISSUE_TITLE="Login API returns 500" \
+DEFAULT_REPO_OWNER="abishekn15" \
+ISSUE_TITLE="Division API crashes" \
 ISSUE_BODY="$(cat <<'EOF'
-Repo: HR-worker-api
+Repo: ai-bugfix-demo-repo
 
 Bug Description:
-Login API crashes when email is empty
+Division crashes when denominator is 0.
 
 Expected Result:
-Validation error
+Should return validation message.
 
 Actual Result:
-500 Internal Server Error
+ZeroDivisionError
 EOF
 )" \
 ISSUE_NUMBER="1" \
-ISSUE_URL="https://github.com/your-org/missionmind-ai-automation/issues/1" \
-ISSUE_AUTHOR="your-github-username" \
+ISSUE_URL="https://github.com/abishekn15/missionmind-ai-automation/issues/1" \
+ISSUE_AUTHOR="abishekn15" \
 python scripts/parse_issue.py
 ```
 
-Expected: structured JSON logs, a `parsed_issue.json` file in the working directory, and fields including `repo_name`, `repo_owner`, and `bug_description`.
-
-To preview the acknowledgement comment GitHub will post:
+Clone the demo repo locally:
 
 ```bash
-python scripts/format_issue_comment.py parsed_issue.json issue_ack_comment.md
-cat issue_ack_comment.md
+rm -rf target-repo
+git clone --depth 1 https://github.com/abishekn15/ai-bugfix-demo-repo.git target-repo
 ```
 
-To point at a target repo in another org without setting `DEFAULT_REPO_OWNER`, add a line to the issue body:
+Run Claude locally:
 
-```text
-Owner: some-other-org
-Repo: HR-worker-api
+```bash
+ANTHROPIC_API_KEY="your-anthropic-api-key" python scripts/claude_fix.py
 ```
 
-## Values To Replace
+Local commit/push/PR scripts require valid GitHub authentication in the same way the workflow uses `GITHUB_TOKEN`.
 
-Replace these example values with your real project values:
+## Troubleshooting
 
-- `HR-worker-api`: the repository name written in each GitHub Issue after `Repo:`.
-- `your-github-org-or-user`: your GitHub org or username used as `DEFAULT_REPO_OWNER` in local runs (the workflow sets this from the automation repo owner on GitHub).
-- `your-org`: your GitHub organization or username in local test URLs.
-- `missionmind-ai-automation`: your GitHub repository name if it is different.
-- `your-github-username`: your GitHub username for local testing.
+`Missing required environment variable: ANTHROPIC_API_KEY`
 
-## Phase 2: Secrets and permissions
+Add the `ANTHROPIC_API_KEY` repository secret.
 
-- **Permissions**: the workflow uses `issues: write` so it can post the acknowledgement comment.
-- **Optional secret `TARGET_REPO_CLONE_TOKEN`**: use a fine-grained PAT or classic PAT with `contents: read` on the **target** repository when it is private or when the default `GITHUB_TOKEN` cannot read it (for example another org). If unset, the clone step uses `github.token`, which is enough for many same-owner public repos.
+`Unsupported bug type`
 
-No other secrets are required for the parse, comment, and clone steps on typical public same-owner setups.
+Use one of the currently supported bug categories: division by zero, missing validation, or wrong HTTP status code.
 
-## Phase 3 (next ideas)
+`Claude returned malformed Python`
 
-Examples of what you can add next: run static analysis or tests in `target-repo/`, call an AI/Cursor API to propose a patch, push a branch and open a pull request on the target repo, or dispatch a workflow in the target repository. Those steps need additional tokens (for example `contents: write` on the target repo for PR creation).
+Claude generated code that failed Python syntax validation. Reopen the issue with a clearer bug description or rerun the workflow.
+
+`No fix generated for any Python file`
+
+The target repo may not contain a related `.py` file, or the issue text may not clearly match the code.
+
+`git push failed`
+
+The branch push can fail if GitHub does not allow this workflow repository’s `GITHUB_TOKEN` to write to the target repository. This is a GitHub token scope limitation. For your current public same-owner demo, clone is expected to work; push/PR depends on GitHub allowing cross-repository writes from the workflow token.
+
+`gh pr create failed`
+
+Check that the branch was pushed successfully and that workflow permissions include `pull-requests: write`.
+
+## Future Improvements
+
+- Add test discovery and run tests before creating a PR.
+- Add file-level allowlists for larger repositories.
+- Support multi-file fixes with a stricter patch format.
+- Add retry labels or issue comments on failed automation.
+- Add a human approval gate before pushing AI-generated changes.
+- Support private or cross-org targets with an explicit GitHub App installation.

@@ -1,3 +1,8 @@
-# Local / CI artifacts from issue parsing (do not commit)
+# Local / CI artifacts from automation runs (do not commit)
+.pycache/
 parsed_issue.json
 issue_ack_comment.md
+fix_result.json
+git_result.json
+pr_result.json
+target-repo/

@@ -1,5 +1,5 @@
 # Workflow name shown in the GitHub Actions tab.
-name: Auto Fix Issue Parser
+name: AI Bug Fix Automation
 
 # Run this workflow only when a new GitHub Issue is opened.
 on:
@@ -7,23 +7,24 @@ on:
     types:
       - opened
 
-# Phase 2 posts an acknowledgement comment on the issue, so the workflow needs
-# write access to issues. Contents stay read-only until you add fix commits.
+# The final flow creates a branch and PR in the target repository and comments
+# the PR URL back on the original issue. These are the only permissions requested.
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
   issues: write
 
 jobs:
-  parse-issue:
+  ai-bug-fix:
     # Use the latest Ubuntu runner provided by GitHub Actions.
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout is required so the runner can access scripts/parse_issue.py.
-      - name: Checkout repository
+      # Checkout the automation repository so the runner can access scripts/.
+      - name: Checkout automation repository
         uses: actions/checkout@v4
 
-      # Install Python for running the issue parsing script.
+      # Python 3.11 is used by all automation scripts.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -46,9 +47,8 @@ jobs:
           echo "Issue body:"
           printf '%s\n' "${ISSUE_BODY}"
 
-      # Pass the issue title and body to the Python parser. Environment variables
-      # preserve multiline issue bodies more safely than command-line arguments.
-      # DEFAULT_REPO_OWNER is used when the issue body does not contain Owner:/Org:.
+      # Parse the issue title/body into parsed_issue.json. Environment variables
+      # preserve multiline bodies without executing issue-provided text.
       - name: Parse issue request
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -60,31 +60,43 @@ jobs:
           PARSED_ISSUE_JSON_PATH: parsed_issue.json
         run: python scripts/parse_issue.py
 
-      # Build a short Markdown comment from parsed_issue.json for the issue thread.
-      - name: Render acknowledgement comment
-        run: python scripts/format_issue_comment.py parsed_issue.json issue_ack_comment.md
-
-      # Post the acknowledgement using the built-in GITHUB_TOKEN (mapped to GH_TOKEN for gh).
-      - name: Post acknowledgement on issue
+      # Clone the public same-owner target repository into target-repo/.
+      # This intentionally uses only the built-in GITHUB_TOKEN.
+      - name: Clone target repository
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh issue comment "${{ github.event.issue.number }}" \
-            --body-file issue_ack_comment.md \
-            --repo "${{ github.repository }}"
-
-      # Shallow clone the target repository so later phases can scan or patch code.
-      # Uses TARGET_REPO_CLONE_TOKEN when set (recommended for private repos); otherwise
-      # falls back to github.token (same org public repos often work).
-      - name: Shallow clone target repository
-        env:
-          TARGET_REPO_CLONE_TOKEN: ${{ secrets.TARGET_REPO_CLONE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          OWNER="$(jq -r .repo_owner parsed_issue.json)"
-          REPO="$(jq -r .repo_name parsed_issue.json)"
-          TOKEN="${TARGET_REPO_CLONE_TOKEN:-${{ github.token }}}"
+          OWNER="$(python -c 'import json; print(json.load(open("parsed_issue.json"))["repo_owner"])')"
+          REPO="$(python -c 'import json; print(json.load(open("parsed_issue.json"))["repo_name"])')"
           rm -rf target-repo
-          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" target-repo
+          git clone --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git" target-repo
           echo "Cloned ${OWNER}/${REPO} into target-repo/"
-          ls -la target-repo | head -n 20
+          find target-repo -maxdepth 1 -type f -print | sort
+
+      # Ask Claude to inspect Python files and overwrite only the affected file.
+      - name: Generate AI bug fix with Claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/claude_fix.py
+
+      # Create ai-fix-<issue-number>, commit the modified file, and push the branch.
+      - name: Commit and push AI fix branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/git_commit_push.py
+
+      # Create a pull request in the target repository using GitHub CLI.
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/create_pr.py
+
+      # Comment the created PR URL back on the original issue in this automation repo.
+      - name: Comment PR URL on original issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          AUTOMATION_REPO: ${{ github.repository }}
+        run: python scripts/comment_pr.py
