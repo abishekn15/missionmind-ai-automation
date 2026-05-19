@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Use Claude to generate a safe Python bug fix inside target-repo/.
+"""Use Claude to generate a safe source-code bug fix inside target-repo/.
 
-This script is intentionally narrow for the first production version:
+This script is intentionally scoped for safe automation:
 - reads issue context from parsed_issue.json
-- scans Python files under target-repo/
-- asks Claude to fix one affected Python file
-- validates the returned code with ast.parse()
+- scans any UTF-8 text file under target-repo/ except .yml/.yaml
+- asks Claude to fix every affected source file it can identify
+- validates generated Python/JSON when possible
 - writes fix_result.json for the git/PR steps
 
 The script never executes code from the issue body or the target repository.
@@ -32,20 +32,40 @@ ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-3-haiku-20240307"
 MAX_FILE_BYTES = 80_000
 MAX_TOTAL_PROMPT_CHARS = 140_000
-SUPPORTED_BUG_KEYWORDS = (
-    "division",
-    "divide",
-    "denominator",
-    "zero",
-    "zerodivision",
-    "validation",
-    "empty",
-    "missing",
-    "http",
-    "status",
-    "500",
-    "400",
-)
+MIN_KEYWORD_LENGTH = 3
+IGNORED_EXTENSIONS = {".yaml", ".yml"}
+SKIPPED_DIRECTORIES = {
+    ".git",
+    ".next",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+}
+STOP_WORDS = {
+    "actual",
+    "and",
+    "are",
+    "bug",
+    "but",
+    "can",
+    "crash",
+    "crashes",
+    "does",
+    "expected",
+    "fix",
+    "for",
+    "from",
+    "issue",
+    "not",
+    "result",
+    "should",
+    "the",
+    "this",
+    "when",
+    "with",
+}
 
 
 class AutomationError(RuntimeError):
@@ -53,11 +73,12 @@ class AutomationError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class PythonFile:
-    """A Python file discovered under target-repo/."""
+class SourceFile:
+    """A UTF-8 text file discovered under target-repo/."""
 
     path: Path
     relative_path: str
+    language: str
     content: str
 
 
@@ -87,16 +108,6 @@ def validate_repo_name(repo_name: str) -> None:
         raise AutomationError(f"Invalid repository name: {repo_name!r}")
 
 
-def ensure_supported_bug(issue_title: str, bug_description: str) -> None:
-    """Fail early for bug categories this first automation version does not target."""
-    haystack = f"{issue_title}\n{bug_description}".lower()
-    if not any(keyword in haystack for keyword in SUPPORTED_BUG_KEYWORDS):
-        raise AutomationError(
-            "Unsupported bug type. Supported examples: division by zero, "
-            "missing validation, and wrong HTTP status code."
-        )
-
-
 def safe_relative_path(path: Path, root: Path) -> str:
     """Return a POSIX relative path after ensuring the file is inside target-repo/."""
     try:
@@ -105,55 +116,78 @@ def safe_relative_path(path: Path, root: Path) -> str:
         raise AutomationError(f"Refusing to read path outside target-repo: {path}") from exc
 
 
-def discover_python_files(target_repo: Path) -> list[PythonFile]:
-    """Read Python files under target-repo/, skipping git metadata and large files."""
+def should_skip_path(path: Path) -> bool:
+    """Skip generated/dependency folders and YAML files."""
+    if any(part in SKIPPED_DIRECTORIES for part in path.parts):
+        return True
+    return path.suffix.lower() in IGNORED_EXTENSIONS
+
+
+def language_for_markdown(path: Path) -> str:
+    """Use a best-effort code fence label without filtering by language."""
+    extension = path.suffix.lower().lstrip(".")
+    if extension in {"yml", "yaml"}:
+        return "yaml"
+    return extension or "text"
+
+
+def discover_source_files(target_repo: Path) -> list[SourceFile]:
+    """Read any UTF-8 text file under target-repo/, skipping YAML and generated folders."""
     if not target_repo.is_dir():
         raise AutomationError(f"Missing target repository directory: {target_repo}")
 
-    files: list[PythonFile] = []
-    for path in sorted(target_repo.rglob("*.py")):
-        if ".git" in path.parts:
+    files: list[SourceFile] = []
+    for path in sorted(item for item in target_repo.rglob("*") if item.is_file()):
+        if should_skip_path(path):
             continue
+
         if path.stat().st_size > MAX_FILE_BYTES:
-            log("INFO", "Skipping large Python file", file=str(path), max_bytes=MAX_FILE_BYTES)
+            log("INFO", "Skipping large source file", file=str(path), max_bytes=MAX_FILE_BYTES)
             continue
+
         relative_path = safe_relative_path(path, target_repo)
         try:
             content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            log("INFO", "Skipping non-UTF-8 Python file", file=relative_path)
+            log("INFO", "Skipping non-UTF-8 source file", file=relative_path)
             continue
-        files.append(PythonFile(path=path, relative_path=relative_path, content=content))
+        language = language_for_markdown(path)
+        files.append(SourceFile(path=path, relative_path=relative_path, language=language, content=content))
 
     if not files:
-        raise AutomationError("No Python files found under target-repo/.")
+        raise AutomationError("No UTF-8 non-YAML files found under target-repo/.")
     return files
 
 
-def rank_candidate_files(files: list[PythonFile], issue_title: str, bug_description: str) -> list[PythonFile]:
-    """Prefer files whose names/content look related to the issue."""
-    haystack = f"{issue_title}\n{bug_description}".lower()
+def extract_issue_keywords(issue_title: str, bug_description: str) -> set[str]:
+    """Extract generic keywords from the report without restricting bug type."""
+    text = f"{issue_title}\n{bug_description}".lower()
+    words = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+|\d+", text)
+    return {
+        word
+        for word in words
+        if len(word) >= MIN_KEYWORD_LENGTH and word not in STOP_WORDS
+    }
 
-    def score(item: PythonFile) -> tuple[int, str]:
+
+def rank_candidate_files(files: list[SourceFile], issue_title: str, bug_description: str) -> list[SourceFile]:
+    """Prefer files whose paths/content overlap with the issue text."""
+    keywords = extract_issue_keywords(issue_title, bug_description)
+
+    def score(item: SourceFile) -> tuple[int, str]:
         text = f"{item.relative_path}\n{item.content}".lower()
-        value = 0
-        if "division" in haystack or "denominator" in haystack or "zerodivision" in haystack:
-            value += 5 if any(token in text for token in ("divide", "division", "denominator", "/")) else 0
-        if "validation" in haystack or "empty" in haystack:
-            value += 3 if any(token in text for token in ("validate", "empty", "none", "request")) else 0
-        if "status" in haystack or "500" in haystack or "http" in haystack:
-            value += 3 if any(token in text for token in ("status", "response", "http", "flask", "fastapi")) else 0
+        value = sum(1 for keyword in keywords if keyword in text)
         return (-value, item.relative_path)
 
     return sorted(files, key=score)
 
 
-def build_repository_context(files: list[PythonFile]) -> str:
-    """Build bounded Python source context for Claude."""
+def build_repository_context(files: list[SourceFile]) -> str:
+    """Build bounded source context for Claude."""
     blocks: list[str] = []
     total = 0
     for item in files:
-        block = f"FILE: {item.relative_path}\n```python\n{item.content}\n```\n"
+        block = f"FILE: {item.relative_path}\n```{item.language}\n{item.content}\n```\n"
         if total + len(block) > MAX_TOTAL_PROMPT_CHARS:
             log("INFO", "Prompt context limit reached", included_files=len(blocks))
             break
@@ -162,17 +196,17 @@ def build_repository_context(files: list[PythonFile]) -> str:
     return "\n".join(blocks)
 
 
-def build_prompt(issue: dict[str, Any], candidate: PythonFile, repository_context: str) -> str:
+def build_prompt(issue: dict[str, Any], candidate: SourceFile, repository_context: str) -> str:
     """Create a strict prompt that asks Claude for one full corrected file."""
-    return f"""You are fixing a Python bug in a GitHub repository.
+    return f"""You are fixing a source-code bug in a GitHub repository. The bug may be backend or UI/frontend.
 
 Safety rules:
 - Modify only the candidate file named below.
-- Return ONLY the complete corrected Python code for that candidate file.
-- Do not include Markdown fences, prose, diffs, explanations, shell commands, or JSON.
+- Return ONLY the complete corrected source code for that candidate file.
+- Do not include Markdown fences, prose, diffs, explanations, shell commands, or metadata JSON.
 - If the candidate file is not the affected file, return exactly: NO_CHANGE
-- Preserve the existing style and public API unless a small validation fix is required.
-- Supported bug classes: division by zero, missing validation, wrong HTTP status code.
+- Preserve the existing style and public API unless the bug fix requires a small behaviour change.
+- Fix the reported bug based on the issue and repository context. Do not invent unrelated changes.
 
 Issue title:
 {issue["issue_title"]}
@@ -186,7 +220,7 @@ Target repository:
 Candidate file to fix:
 {candidate.relative_path}
 
-Repository Python context:
+Repository source context:
 {repository_context}
 """
 
@@ -256,22 +290,28 @@ def normalize_claude_code(response_text: str) -> str | None:
     return text
 
 
-def validate_python_code(code: str, relative_path: str) -> None:
-    """Ensure Claude returned syntactically valid Python."""
-    try:
-        ast.parse(code, filename=relative_path)
-    except SyntaxError as exc:
-        raise AutomationError(f"Claude returned malformed Python for {relative_path}: {exc}") from exc
+def validate_generated_code(code: str, source_file: SourceFile) -> None:
+    """Validate returned code when a safe stdlib parser exists."""
+    if source_file.path.suffix.lower() == ".py":
+        try:
+            ast.parse(code, filename=source_file.relative_path)
+        except SyntaxError as exc:
+            raise AutomationError(f"Claude returned malformed Python for {source_file.relative_path}: {exc}") from exc
+    elif source_file.path.suffix.lower() == ".json":
+        try:
+            json.loads(code)
+        except json.JSONDecodeError as exc:
+            raise AutomationError(f"Claude returned malformed JSON for {source_file.relative_path}: {exc}") from exc
 
 
-def write_fix_result(path: Path, modified_file: str, issue: dict[str, Any]) -> None:
+def write_fix_result(path: Path, modified_files: list[str], issue: dict[str, Any]) -> None:
     """Persist modified-file metadata for commit and PR scripts."""
     payload = {
         "repo_owner": issue["repo_owner"],
         "repo_name": issue["repo_name"],
         "issue_number": issue["issue_number"],
         "issue_title": issue["issue_title"],
-        "modified_files": [modified_file],
+        "modified_files": modified_files,
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -289,13 +329,14 @@ def main() -> int:
                 raise AutomationError(f"parsed_issue.json missing required field: {key}")
 
         validate_repo_name(str(issue["repo_name"]))
-        ensure_supported_bug(str(issue["issue_title"]), str(issue["bug_description"]))
 
         target_repo = Path("target-repo")
-        python_files = discover_python_files(target_repo)
-        ranked_files = rank_candidate_files(python_files, str(issue["issue_title"]), str(issue["bug_description"]))
-        repository_context = build_repository_context(python_files)
+        source_files = discover_source_files(target_repo)
+        ranked_files = rank_candidate_files(source_files, str(issue["issue_title"]), str(issue["bug_description"]))
+        repository_context = build_repository_context(source_files)
         model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+
+        modified_files: list[str] = []
 
         for candidate in ranked_files:
             log("INFO", "Requesting Claude fix for candidate file", file=candidate.relative_path, model=model)
@@ -309,13 +350,17 @@ def main() -> int:
                 log("INFO", "Claude returned unchanged code", file=candidate.relative_path)
                 continue
 
-            validate_python_code(corrected_code, candidate.relative_path)
+            validate_generated_code(corrected_code, candidate)
             candidate.path.write_text(corrected_code.rstrip() + "\n", encoding="utf-8")
-            write_fix_result(Path("fix_result.json"), candidate.relative_path, issue)
+            modified_files.append(candidate.relative_path)
             log("INFO", "Fix applied", file_modified=candidate.relative_path, fix_applied=True)
+
+        if modified_files:
+            write_fix_result(Path("fix_result.json"), modified_files, issue)
+            log("INFO", "All fixes applied", modified_files=modified_files, modified_file_count=len(modified_files))
             return 0
 
-        raise AutomationError("No fix generated for any Python file.")
+        raise AutomationError("No fix generated for any UTF-8 non-YAML file.")
     except AutomationError as exc:
         log("ERROR", "Claude fix failed", error=str(exc))
         return 1

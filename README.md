@@ -1,6 +1,6 @@
 # MissionMind AI Automation
 
-This repository contains an end-to-end GitHub Issue driven AI bug-fixing workflow. When an issue is opened in `missionmind-ai-automation`, GitHub Actions parses the issue, clones the public same-owner target repo, asks Claude to patch the affected Python file, pushes an `ai-fix-*` branch, opens a pull request, and comments the PR URL back on the original issue.
+This repository contains an end-to-end GitHub Issue driven AI bug-fixing workflow. When an issue is opened in `missionmind-ai-automation`, GitHub Actions parses the issue, clones the public same-owner target repo, asks Claude to patch the affected backend or UI source file, pushes an `ai-fix-*` branch, opens a pull request, and comments the PR URL back on the original issue.
 
 ## Architecture
 
@@ -52,7 +52,7 @@ The job uses `ubuntu-latest` and Python `3.11`, then runs:
 2. Parse the issue title/body into `parsed_issue.json`.
 3. Clone the target repo into `target-repo/` using only the built-in `GITHUB_TOKEN`.
 4. Run Claude using `ANTHROPIC_API_KEY` (default model: **claude-3-haiku-20240307** for lower cost).
-5. Overwrite only the affected Python file inside `target-repo/`.
+5. Overwrite only the affected source file inside `target-repo/`.
 6. Create branch `ai-fix-<issue-number>`.
 7. Commit the generated change.
 8. Push the branch.
@@ -167,21 +167,24 @@ Please review before merging.
 - Automation scripts only modify files inside `target-repo/`.
 - Issue body text is never executed as a shell command.
 - Repository names are validated before clone/push usage.
-- Claude is asked to return only complete corrected Python code.
-- Claude output is rejected if it is empty, unchanged, Markdown-wrapped, or invalid Python.
-- Only Python files under `target-repo/` are scanned.
-- Large Python files are skipped to keep prompts bounded.
+- Claude is asked to return only the complete corrected source code for each affected candidate file.
+- Claude output is rejected if it is empty, unchanged, Markdown-wrapped, or invalid where validation is available.
+- Any UTF-8 text file under `target-repo/` can be scanned and fixed.
+- YAML files (`.yml` and `.yaml`) are always ignored.
+- Large source files are skipped to keep prompts bounded.
 - Structured JSON logs are printed for every major step.
 
-## Supported Bug Types
+## Bug Scope
 
-The current `claude_fix.py` supports focused Python fixes for:
+The workflow will attempt to fix any clearly reported bug in the target repository. It does not filter by bug type or programming language.
 
-- division by zero
-- missing validation
-- wrong HTTP status code
+For safety, the automation still stays narrow in how it applies changes:
 
-Unsupported bug categories fail safely instead of producing broad or risky edits.
+- any UTF-8 text file under `target-repo/` can be scanned
+- `.yml` and `.yaml` files are always ignored
+- Claude may overwrite multiple affected candidate files in one run
+- generated Python and JSON are validated with Python stdlib parsers
+- unchanged, empty, Markdown-wrapped, or malformed Claude output is rejected
 
 ## Local Testing
 
@@ -232,17 +235,13 @@ Local commit/push/PR scripts require valid GitHub authentication in the same way
 
 Add the `ANTHROPIC_API_KEY` repository secret.
 
-`Unsupported bug type`
+`Claude returned malformed Python` / `Claude returned malformed JSON`
 
-Use one of the currently supported bug categories: division by zero, missing validation, or wrong HTTP status code.
+Claude generated code that failed available syntax validation. Reopen the issue with a clearer bug description or rerun the workflow.
 
-`Claude returned malformed Python`
+`No fix generated for any UTF-8 non-YAML file`
 
-Claude generated code that failed Python syntax validation. Reopen the issue with a clearer bug description or rerun the workflow.
-
-`No fix generated for any Python file`
-
-The target repo may not contain a related `.py` file, or the issue text may not clearly match the code.
+The target repo may not contain a related UTF-8 non-YAML file, or the issue text may not clearly match the code.
 
 `git push failed`
 
