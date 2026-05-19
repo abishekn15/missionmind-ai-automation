@@ -1,0 +1,3 @@
+# Local / CI artifacts from issue parsing (do not commit)
+parsed_issue.json
+issue_ack_comment.md

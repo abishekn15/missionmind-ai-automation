@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Parse GitHub Issue details for Phase 1 automation.
+"""Parse GitHub Issue details for the automation pipeline.
 
 The GitHub Actions workflow passes issue data through environment variables.
 This script extracts the target repository name and bug description, validates
-required fields, and prints structured logs for downstream automation phases.
+required fields, prints structured logs, and optionally writes parsed_issue.json
+for Phase 2 (issue comments, cloning the target repository).
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 
 class IssueParseError(ValueError):
@@ -27,6 +29,7 @@ class IssueContext:
     issue_title: str
     issue_url: str
     issue_author: str
+    repo_owner: str
     repo_name: str
     bug_description: str
 
@@ -50,6 +53,31 @@ def extract_repo_name(issue_body: str) -> str:
     if not match:
         raise IssueParseError("Issue body must include a 'Repo: <repository-name>' line.")
     return match.group("repo")
+
+
+def extract_repo_owner(issue_body: str) -> str | None:
+    """Extract optional owner/org from 'Owner: acme' or 'Org: acme' in the issue body."""
+    match = re.search(
+        r"(?im)^\s*(?:owner|org)\s*:\s*(?P<owner>[A-Za-z0-9_.-]+)\s*$",
+        issue_body,
+    )
+    if not match:
+        return None
+    return match.group("owner")
+
+
+def resolve_repo_owner(issue_body: str) -> str:
+    """Prefer explicit Owner/Org in the body; otherwise use DEFAULT_REPO_OWNER env."""
+    explicit = extract_repo_owner(issue_body)
+    if explicit:
+        return explicit
+    default = get_optional_env("DEFAULT_REPO_OWNER")
+    if not default:
+        raise IssueParseError(
+            "Set an 'Owner: <github-org-or-user>' line in the issue body, "
+            "or pass DEFAULT_REPO_OWNER from the workflow (typically the automation repo owner)."
+        )
+    return default
 
 
 def extract_section(issue_body: str, section_name: str) -> str:
@@ -76,9 +104,16 @@ def parse_issue_from_environment() -> IssueContext:
         issue_title=get_required_env("ISSUE_TITLE"),
         issue_url=get_optional_env("ISSUE_URL", "unknown"),
         issue_author=get_optional_env("ISSUE_AUTHOR", "unknown"),
+        repo_owner=resolve_repo_owner(issue_body),
         repo_name=extract_repo_name(issue_body),
         bug_description=extract_section(issue_body, "Bug Description"),
     )
+
+
+def write_parsed_json(issue_context: IssueContext, output_path: Path) -> None:
+    """Write machine-readable output for downstream workflow steps."""
+    payload = asdict(issue_context)
+    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def log_info(message: str, **fields: str) -> None:
@@ -105,9 +140,19 @@ def main() -> int:
     log_info("Parsed GitHub Issue successfully", **parsed_data)
     log_info(
         "Automation input summary",
+        repo_owner=issue_context.repo_owner,
         repo_name=issue_context.repo_name,
         bug_description=issue_context.bug_description,
     )
+
+    json_path_raw = os.getenv("PARSED_ISSUE_JSON_PATH", "").strip()
+    output_path = Path(json_path_raw or "parsed_issue.json")
+    try:
+        write_parsed_json(issue_context, output_path)
+    except OSError as error:
+        log_error("Failed to write parsed issue JSON", path=str(output_path), error=str(error))
+        return 1
+    log_info("Wrote parsed issue JSON", path=str(output_path))
     return 0
 
 

@@ -7,11 +7,11 @@ on:
     types:
       - opened
 
-# Keep permissions minimal for this phase because the workflow only reads issue data
-# from the GitHub event payload and writes logs.
+# Phase 2 posts an acknowledgement comment on the issue, so the workflow needs
+# write access to issues. Contents stay read-only until you add fix commits.
 permissions:
   contents: read
-  issues: read
+  issues: write
 
 jobs:
   parse-issue:
@@ -48,6 +48,7 @@ jobs:
 
       # Pass the issue title and body to the Python parser. Environment variables
       # preserve multiline issue bodies more safely than command-line arguments.
+      # DEFAULT_REPO_OWNER is used when the issue body does not contain Owner:/Org:.
       - name: Parse issue request
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
@@ -55,4 +56,35 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
           ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          DEFAULT_REPO_OWNER: ${{ github.repository_owner }}
+          PARSED_ISSUE_JSON_PATH: parsed_issue.json
         run: python scripts/parse_issue.py
+
+      # Build a short Markdown comment from parsed_issue.json for the issue thread.
+      - name: Render acknowledgement comment
+        run: python scripts/format_issue_comment.py parsed_issue.json issue_ack_comment.md
+
+      # Post the acknowledgement using the built-in GITHUB_TOKEN (mapped to GH_TOKEN for gh).
+      - name: Post acknowledgement on issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body-file issue_ack_comment.md \
+            --repo "${{ github.repository }}"
+
+      # Shallow clone the target repository so later phases can scan or patch code.
+      # Uses TARGET_REPO_CLONE_TOKEN when set (recommended for private repos); otherwise
+      # falls back to github.token (same org public repos often work).
+      - name: Shallow clone target repository
+        env:
+          TARGET_REPO_CLONE_TOKEN: ${{ secrets.TARGET_REPO_CLONE_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="$(jq -r .repo_owner parsed_issue.json)"
+          REPO="$(jq -r .repo_name parsed_issue.json)"
+          TOKEN="${TARGET_REPO_CLONE_TOKEN:-${{ github.token }}}"
+          rm -rf target-repo
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" target-repo
+          echo "Cloned ${OWNER}/${REPO} into target-repo/"
+          ls -la target-repo | head -n 20
